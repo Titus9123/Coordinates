@@ -1,0 +1,5 @@
+{
+  "name": "Netivot Coordinates Fixer",
+  "description": "A local tool to process Excel files, normalize addresses, and geocode them using Nominatim within Netivot boundaries.",
+  "requestFramePermissions": []
+}
