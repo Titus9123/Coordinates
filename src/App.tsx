@@ -14,6 +14,147 @@ import { readExcel, exportExcel } from "./services/excel";
 import { normalizeAddress, getAddressFromRow } from "./services/normalization";
 import { batchGeocode, getCachedResult } from "./services/geocoding";
 
+// --------------------------------------------------
+// Helper: simple Netivot bounding box (approximate)
+// --------------------------------------------------
+const NETIVOT_BOUNDS = {
+  minLat: 31.38,
+  maxLat: 31.47,
+  minLon: 34.55,
+  maxLon: 34.63,
+};
+
+function isInsideNetivot(lat: number | null | undefined, lon: number | null | undefined): boolean {
+  if (typeof lat !== "number" || typeof lon !== "number") return false;
+  return (
+    lat >= NETIVOT_BOUNDS.minLat &&
+    lat <= NETIVOT_BOUNDS.maxLat &&
+    lon >= NETIVOT_BOUNDS.minLon &&
+    lon <= NETIVOT_BOUNDS.maxLon
+  );
+}
+
+// --------------------------------------------------
+// Helper: distance between two coords (meters)
+// --------------------------------------------------
+function distanceMeters(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371000;
+  const toRad = (v: number) => (v * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+// --------------------------------------------------
+// Helper: clasificar una fila según el cache (parcial/final)
+// --------------------------------------------------
+function classifyRowFromCache(row: AddressRow, allowNotFound: boolean): AddressRow {
+  const normalized = row.normalizedAddress || "";
+  const hasNormalized = !!row.normalizedAddress;
+  const hasNumber = hasNormalized && /\d+/.test(normalized);
+
+  // Si ya está resuelta, no la tocamos
+  if (
+    row.status === ProcessingStatus.SKIPPED ||
+    row.status === ProcessingStatus.CONFIRMED ||
+    row.status === ProcessingStatus.UPDATED ||
+    row.status === ProcessingStatus.NOT_FOUND
+  ) {
+    return row;
+  }
+
+  // 1) Sin dirección usable → דולג (חסרה כתובת מלאה)
+  if (!hasNormalized) {
+    return {
+      ...row,
+      status: ProcessingStatus.SKIPPED,
+      message: "חסרה כתובת מלאה",
+      finalCoords: undefined,
+    };
+  }
+
+  // 2) Dirección sin número → también מידע חסר
+  if (!hasNumber) {
+    return {
+      ...row,
+      status: ProcessingStatus.SKIPPED,
+      message: "חסרה כתובת מלאה (אין מספר בית)",
+      finalCoords: undefined,
+    };
+  }
+
+  const originalLat = row.originalCoords?.lat ?? null;
+  const originalLon = row.originalCoords?.lon ?? null;
+  const origInside = isInsideNetivot(originalLat, originalLon);
+
+  const result = getCachedResult(normalized);
+
+  // 3) Todavía no hay resultado de API en el cache
+  if (!result) {
+    if (!allowNotFound) {
+      // Fase parcial: seguimos esperando resultado
+      return row;
+    }
+
+    // Fase final: ya terminó la API, decidimos con lo que hay
+    if (origInside) {
+      return {
+        ...row,
+        status: ProcessingStatus.CONFIRMED,
+        finalCoords: undefined,
+        message: "כתובת תקינה – נעשה שימוש בקואורדינטות המקור",
+      };
+    }
+
+    return {
+      ...row,
+      status: ProcessingStatus.NOT_FOUND,
+      finalCoords: undefined,
+      message: "לא נמצא במפה",
+    };
+  }
+
+  // 4) Hay resultado de API
+  const newLat = result.lat;
+  const newLon = result.lon;
+  const newInside = isInsideNetivot(newLat, newLon);
+
+  // Resultado fuera de נתיבות pero original dentro → nos quedamos con original
+  if (!newInside && origInside) {
+    return {
+      ...row,
+      status: ProcessingStatus.CONFIRMED,
+      finalCoords: undefined,
+      message: "תוצאת המפה מחוץ לנתיבות – נשמרו קואורדינטות המקור",
+    };
+  }
+
+  // Si original estaba bien y el cambio es muy chico → CONFIRMED
+  if (origInside && originalLat !== null && originalLon !== null) {
+    const dist = distanceMeters(originalLat, originalLon, newLat, newLon);
+    if (dist <= 30) {
+      return {
+        ...row,
+        status: ProcessingStatus.CONFIRMED,
+        finalCoords: undefined,
+        message: "הקואורדינטות המקוריות תקינות (שינוי זניח)",
+      };
+    }
+  }
+
+  // Si llegamos aquí, de verdad actualizamos coords
+  return {
+    ...row,
+    status: ProcessingStatus.UPDATED,
+    finalCoords: result,
+    message: 'עודכן ע"י Nominatim',
+  };
+}
+
 function StatusBadge({ status }: { status: ProcessingStatus }) {
   switch (status) {
     case ProcessingStatus.PENDING:
@@ -27,7 +168,9 @@ function StatusBadge({ status }: { status: ProcessingStatus }) {
     case ProcessingStatus.NOT_FOUND:
       return <span className="px-2 py-1 rounded text-xs bg-red-100 text-red-700">לא נמצא</span>;
     case ProcessingStatus.SKIPPED:
-      return <span className="px-2 py-1 rounded text-xs bg-orange-100 text-orange-700">דולג (חסר)</span>;
+      return (
+        <span className="px-2 py-1 rounded text-xs bg-orange-100 text-orange-700">דולג (חסר)</span>
+      );
     default:
       return null;
   }
@@ -90,58 +233,46 @@ function App() {
 
   const startProcessing = async () => {
     if (isProcessing) return;
+    if (rows.length === 0) return;
+
     setIsProcessing(true);
 
-    const uniqueAddresses = Array.from(
+    // Direcciones únicas con número de casa (para geocoding)
+    const addressesToGeocode = Array.from(
       new Set(
         rows
-          .map((r) => r.normalizedAddress)
-          .filter((a): a is string => a !== null)
+          .filter(
+            (r) =>
+              r.normalizedAddress &&
+              /\d+/.test(r.normalizedAddress) // debe tener número
+          )
+          .map((r) => r.normalizedAddress as string)
       )
     );
 
-    setTotalUnique(uniqueAddresses.length);
+    setTotalUnique(addressesToGeocode.length);
     setProcessedUnique(0);
     setApiRequestsCount(0);
 
-    // Run batch geocoding
-    await batchGeocode(uniqueAddresses, 3, (count, isCacheHit) => {
+    // 1) Pasada inicial: marcar SKIPPED inmediato donde corresponde
+    setRows((prev) => prev.map((row) => classifyRowFromCache(row, false)));
+
+    // 2) Cada vez que avanza la API, aplicamos resultados parciales
+    const applyPartialResults = () => {
+      setRows((prev) => prev.map((row) => classifyRowFromCache(row, false)));
+    };
+
+    // 3) Geocoding en batch, actualizando barra + stats en tiempo real
+    await batchGeocode(addressesToGeocode, 3, (count, isCacheHit) => {
       setProcessedUnique((prev) => prev + count);
       if (!isCacheHit) {
         setApiRequestsCount((prev) => prev + 1);
       }
+      applyPartialResults();
     });
 
-    // Update rows with results
-    setRows((prevRows) => {
-      return prevRows.map((row) => {
-        if (!row.normalizedAddress) {
-          return {
-            ...row,
-            status: ProcessingStatus.SKIPPED,
-            message: "חסרה כתובת מלאה",
-            finalCoords: undefined,
-          };
-        }
-
-        const result = getCachedResult(row.normalizedAddress);
-        if (result) {
-          return {
-            ...row,
-            status: ProcessingStatus.UPDATED,
-            finalCoords: result,
-            message: "עודכן ע\"י Nominatim",
-          };
-        } else {
-          return {
-            ...row,
-            status: ProcessingStatus.NOT_FOUND,
-            finalCoords: undefined,
-            message: "לא נמצא במפה",
-          };
-        }
-      });
-    });
+    // 4) Pasada final: lo que siga pendiente se resuelve a CONFIRMED / NOT_FOUND
+    setRows((prev) => prev.map((row) => classifyRowFromCache(row, true)));
 
     setIsProcessing(false);
   };
@@ -152,7 +283,12 @@ function App() {
   }, [rows, statusFilter]);
 
   const stats = useMemo(() => {
-    const updated = rows.filter((r) => r.status === ProcessingStatus.UPDATED).length;
+    const updated =
+      rows.filter(
+        (r) =>
+          r.status === ProcessingStatus.UPDATED ||
+          r.status === ProcessingStatus.CONFIRMED
+      ).length;
     const notFound = rows.filter((r) => r.status === ProcessingStatus.NOT_FOUND).length;
     const skipped = rows.filter((r) => r.status === ProcessingStatus.SKIPPED).length;
     return { updated, notFound, skipped };
@@ -229,22 +365,32 @@ function App() {
                     התחל עיבוד
                   </button>
                 )}
-              </div>
 
-              {isProcessing && (
-                <div className="mt-6">
-                  <div className="flex justify-between text-sm mb-1">
-                    <span>מעבד כתובות...</span>
-                    <span>{Math.round((processedUnique / totalUnique) * 100)}%</span>
+                {isProcessing && (
+                  <div className="w-full md:w-1/2 mt-4 md:mt-0">
+                    <div className="flex justify-between text-sm mb-1">
+                      <span>מעבד כתובות...</span>
+                      <span>
+                        {totalUnique > 0
+                          ? Math.round((processedUnique / totalUnique) * 100)
+                          : 0}
+                        %
+                      </span>
+                    </div>
+                    <div className="w-full bg-gray-200 rounded-full h-2.5">
+                      <div
+                        className="bg-indigo-600 h-2.5 rounded-full transition-all duration-300"
+                        style={{
+                          width:
+                            totalUnique > 0
+                              ? `${(processedUnique / totalUnique) * 100}%`
+                              : "0%",
+                        }}
+                      ></div>
+                    </div>
                   </div>
-                  <div className="w-full bg-gray-200 rounded-full h-2.5">
-                    <div
-                      className="bg-indigo-600 h-2.5 rounded-full transition-all duration-300"
-                      style={{ width: `${(processedUnique / totalUnique) * 100}%` }}
-                    ></div>
-                  </div>
-                </div>
-              )}
+                )}
+              </div>
             </div>
 
             {/* Filter Cards */}
@@ -261,7 +407,7 @@ function App() {
                   <CheckCircle className="text-green-500" />
                   <span className="text-2xl font-bold">{stats.updated}</span>
                 </div>
-                <span className="text-sm text-gray-600 mt-2 block">עודכנו בהצלחה</span>
+                <span className="text-sm text-gray-600 mt-2 block">עודכנו בהצלחה / תקינים</span>
               </button>
 
               <button
@@ -316,21 +462,42 @@ function App() {
                 <table className="min-w-full divide-y divide-gray-200">
                   <thead className="bg-gray-50">
                     <tr>
-                      <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">#</th>
-                      <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">כתובת מקורית</th>
-                      <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">קואורדינטות מקור</th>
-                      <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">קואורדינטות חדשות</th>
-                      <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">סטטוס</th>
-                      <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">הודעה</th>
+                      <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        #
+                      </th>
+                      <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        כתובת מקורית
+                      </th>
+                      <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        קואורדינטות מקור
+                      </th>
+                      <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        קואורדינטות חדשות
+                      </th>
+                      <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        סטטוס
+                      </th>
+                      <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        הודעה
+                      </th>
                     </tr>
                   </thead>
                   <tbody className="bg-white divide-y divide-gray-200">
                     {displayedRows.map((row) => (
                       <tr key={row.id} className="hover:bg-gray-50">
-                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{parseInt(row.id) + 1}</td>
-                        <td className="px-6 py-4 text-sm text-gray-900 max-w-xs truncate" title={row.address}>{row.address}</td>
+                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                          {parseInt(row.id) + 1}
+                        </td>
+                        <td
+                          className="px-6 py-4 text-sm text-gray-900 max-w-xs truncate"
+                          title={row.address}
+                        >
+                          {row.address}
+                        </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500" dir="ltr">
-                          {row.originalCoords ? `${row.originalCoords.lat}, ${row.originalCoords.lon}` : "-"}
+                          {row.originalCoords
+                            ? `${row.originalCoords.lat}, ${row.originalCoords.lon}`
+                            : "-"}
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm font-medium" dir="ltr">
                           {row.finalCoords ? (
@@ -344,7 +511,9 @@ function App() {
                         <td className="px-6 py-4 whitespace-nowrap">
                           <StatusBadge status={row.status} />
                         </td>
-                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{row.message}</td>
+                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                          {row.message}
+                        </td>
                       </tr>
                     ))}
                   </tbody>

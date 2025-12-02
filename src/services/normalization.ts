@@ -1,48 +1,182 @@
-export function getAddressFromRow(data: Record<string, any>): string {
-  // Heuristic to find relevant columns
-  const keys = Object.keys(data);
-  
-  const streetKey = keys.find(k => /רחוב|street/i.test(k));
-  const numberKey = keys.find(k => /בית|מספר|number|house/i.test(k) && !/phone|טלפון/i.test(k));
-  const cityKey = keys.find(k => /עיר|city|יישוב/i.test(k));
-  const neighborhoodKey = keys.find(k => /שכונה|neighborhood/i.test(k));
+// ---------------------------------------------
+// Helpers
+// ---------------------------------------------
 
-  let addressParts: string[] = [];
-
-  if (streetKey && data[streetKey]) addressParts.push(String(data[streetKey]));
-  if (numberKey && data[numberKey]) addressParts.push(String(data[numberKey]));
-  if (neighborhoodKey && data[neighborhoodKey]) addressParts.push(String(data[neighborhoodKey]));
-  
-  // Default to Netivot if no city is found or if it's explicitly Netivot
-  if (cityKey && data[cityKey]) {
-    addressParts.push(String(data[cityKey]));
-  } else {
-    // If city is missing, we assume Netivot for the context of this app
-    addressParts.push("נתיבות");
+/**
+ * Encuentra la key original en el objeto `data` usando una función
+ * de predicado sobre la versión normalizada (trim + lowercase).
+ */
+function findKeyByPattern(
+  data: Record<string, any>,
+  matcher: (canonical: string) => boolean
+): string | undefined {
+  for (const key of Object.keys(data)) {
+    const canonical = key.trim().toLowerCase();
+    if (matcher(canonical)) {
+      return key;
+    }
   }
-
-  return addressParts.join(" ");
+  return undefined;
 }
 
+/**
+ * Aplica reemplazos simples basados en patrones conocidos.
+ * Esto es específico para Netivot y sus barrios.
+ */
+function applyReplacementDictionary(value: string): string {
+  let result = value;
+
+  const replacements: Array<[RegExp, string]> = [
+    // Variantes de "מערב נתיבות"
+    [/\bמערב[-\s]*נתיבות\b/g, "נתיבות"],
+    [/\bנתיבות[-\s]*מערב\b/g, "נתיבות"],
+
+    // Barrios de Netivot (mantener nombre pero asegurar ciudad luego)
+    [/\bקרית מנחם\b/g, "קרית מנחם"],
+    [/\bקריית מנחם\b/g, "קרית מנחם"],
+    [/\bשכו'? ?החורש\b/g, "שכונת החורש"],
+    [/\bהחורש\b/g, "שכונת החורש"],
+    [/\bנווה נוי\b/g, "נווה נוי"],
+    [/\bנווה שרון\b/g, "נווה שרון"],
+
+    // Errores comunes de transliteración / escritura (ejemplos)
+    [/\bתילתן\b/g, "תלתן"],
+  ];
+
+  for (const [pattern, replacement] of replacements) {
+    result = result.replace(pattern, replacement);
+  }
+
+  return result;
+}
+
+/**
+ * Limpia prefijos redundantes como "רחוב" o "רח'".
+ */
+function stripStreetPrefixes(value: string): string {
+  return value.replace(/^\s*(רחוב|רח'|רח)\s+/g, "");
+}
+
+/**
+ * Normaliza espacios y comas.
+ */
+function normalizeWhitespaceAndCommas(value: string): string {
+  return value
+    .replace(/\s+/g, " ")
+    .replace(/,+/g, ",")
+    .replace(/\s*,\s*/g, ", ")
+    .trim();
+}
+
+// ---------------------------------------------
+// Address extraction from row (fixed & clean)
+// ---------------------------------------------
+export function getAddressFromRow(data: Record<string, any>): string {
+  // Encontrar las keys reales usando el objeto original (no lowercase)
+  const streetKey = findKeyByPattern(data, k =>
+    /(רחוב|רח'|כתובת|street)/i.test(k)
+  );
+
+  const numberKey = findKeyByPattern(
+    data,
+    k => /(מספר|בית|num|number|house)/i.test(k) && !/(טלפון|phone)/i.test(k)
+  );
+
+  const cityKey = findKeyByPattern(data, k => /(עיר|city)/i.test(k));
+
+  const neighborhoodKey = findKeyByPattern(data, k =>
+    /(שכונה|neighborhood)/i.test(k)
+  );
+
+  const parts: string[] = [];
+
+  if (streetKey && data[streetKey]) {
+    parts.push(String(data[streetKey]).trim());
+  }
+
+  if (numberKey && data[numberKey]) {
+    parts.push(String(data[numberKey]).trim());
+  }
+
+  if (neighborhoodKey && data[neighborhoodKey]) {
+    parts.push(String(data[neighborhoodKey]).trim());
+  }
+
+  // City fallback logic
+  if (cityKey && data[cityKey]) {
+    parts.push(String(data[cityKey]).trim());
+  } else {
+    // Por defecto asumimos Netivot si no se especifica ciudad
+    parts.push("נתיבות");
+  }
+
+  // Unir en una sola cadena y hacer una primera limpieza básica
+  const rawAddress = parts.join(" ").trim();
+
+  return normalizeAddress(rawAddress) ?? rawAddress;
+}
+
+// ---------------------------------------------
+// Address normalization (Netivot-focused logic)
+// ---------------------------------------------
 export function normalizeAddress(raw: string): string | null {
-  if (!raw || !raw.trim()) return null;
+  if (!raw) return null;
 
-  // Cleanup: remove extra spaces, unify punctuation
-  let normalized = raw.trim().replace(/\s+/g, " ").replace(/,+/g, ",");
+  // 1) Limpieza básica
+  let normalized = raw.trim();
+  if (!normalized) return null;
 
-  // Basic validation heuristics
-  
-  // Check if it has at least a street name and a number
-  // Pattern: Hebrew/Chars followed by digits
+  normalized = normalizeWhitespaceAndCommas(normalized);
+
+  // 2) Aplicar diccionario de reemplazos conocidos (barrios, variantes, etc.)
+  normalized = applyReplacementDictionary(normalized);
+
+  // 3) Quitar prefijos de calle redundantes
+  normalized = stripStreetPrefixes(normalized);
+
+  // 4) Asegurar presencia de "נתיבות" cuando hay barrios de Netivot
+  const hasNetivot = /נתיבות/.test(normalized);
+  const hasNetivotNeighborhood = /(נווה נוי|נווה שרון|קרית מנחם|קריית מנחם|שכונת החורש)/.test(
+    normalized
+  );
+
+  if (!hasNetivot && hasNetivotNeighborhood) {
+    normalized = `${normalized} נתיבות`;
+  }
+
+  // 5) Evitar duplicados tipo "נתיבות נתיבות"
+  normalized = normalized.replace(/\b(נתיבות)(?:\s+\1)+\b/g, "נתיבות");
+
+  // 6) Forzar formato "רחוב מספר, נתיבות" cuando hay número y Netivot
   const hasNumber = /\d+/.test(normalized);
-  const tokenCount = normalized.split(" ").length;
 
-  // Very loose filtering:
-  // Must have at least 2 words (e.g. "Street 5") and contain a digit.
-  // Exception: "CityName" alone is invalid.
-  
-  if (!hasNumber || tokenCount < 2) {
-      return null;
+  if (hasNumber && /נתיבות/.test(normalized)) {
+    // Ej: "שליו 2 נתיבות" -> "שליו 2, נתיבות"
+    normalized = normalized.replace(
+      /^(.+?\d+)\s+(נתיבות.*)$/,
+      (_match, addrPart, cityPart) => {
+        return `${String(addrPart).trim()}, ${String(cityPart).trim()}`;
+      }
+    );
+  }
+
+  // 7) Detección de direcciones incompletas
+  //    Regla dura del negocio:
+  //    - Si es solo ciudad ("נתיבות") o solo nombre de calle sin número,
+  //      NO geocodificar → devolver null para que la app marque
+  //      "חסרה כתובת מלאה" y deje lat/lon vacíos.
+
+  const hebrewOnly = /^[\u0590-\u05FF\s'"-]+$/;
+
+  if (hebrewOnly.test(normalized) && !hasNumber) {
+    // Ejemplos: "נתיבות", "הרב צבאן", "קרית מנחם נתיבות"
+    return null;
+  }
+
+  // 8) Si no hay ningún token útil, consideramos que no hay dirección
+  const tokenCount = normalized.split(" ").filter(Boolean).length;
+  if (tokenCount === 0) {
+    return null;
   }
 
   return normalized;
