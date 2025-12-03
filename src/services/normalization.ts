@@ -21,25 +21,20 @@ function findKeyByPattern(
 
 /**
  * Aplica reemplazos simples basados en patrones conocidos.
- * Esto es específico para Netivot y sus barrios.
+ * Esto es específico para Netivot y sus variantes de escritura.
+ *
+ * Importante: aquí NO agregamos barrios, solo corregimos cosas como
+ * errores de escritura de calles u orden de palabras.
  */
 function applyReplacementDictionary(value: string): string {
   let result = value;
 
   const replacements: Array<[RegExp, string]> = [
-    // Variantes de "מערב נתיבות"
+    // Variantes de "מערב נתיבות" -> solo ciudad
     [/\bמערב[-\s]*נתיבות\b/g, "נתיבות"],
     [/\bנתיבות[-\s]*מערב\b/g, "נתיבות"],
 
-    // Barrios de Netivot (mantener nombre pero asegurar ciudad luego)
-    [/\bקרית מנחם\b/g, "קרית מנחם"],
-    [/\bקריית מנחם\b/g, "קרית מנחם"],
-    [/\bשכו'? ?החורש\b/g, "שכונת החורש"],
-    [/\bהחורש\b/g, "שכונת החורש"],
-    [/\bנווה נוי\b/g, "נווה נוי"],
-    [/\bנווה שרון\b/g, "נווה שרון"],
-
-    // Errores comunes de transliteración / escritura (ejemplos)
+    // Errores comunes de escritura de calles
     [/\bתילתן\b/g, "תלתן"],
   ];
 
@@ -68,6 +63,93 @@ function normalizeWhitespaceAndCommas(value: string): string {
     .trim();
 }
 
+/**
+ * Lista agresiva de patrones de barrios / zonas de נתיבות
+ * que deben ser ELIMINADOS de la parte de dirección antes del geocoding.
+ *
+ * La ciudad "נתיבות" NO se elimina nunca aquí.
+ */
+const NEIGHBORHOOD_PATTERNS: RegExp[] = [
+  // נווה נוי
+  /\bנווה נוי\b/g,
+  /\bנווה[-\s]*נוי\b/g,
+  /\bנוה נוי\b/g,
+  /\bנ"י\b/g,
+
+  // נווה שרון
+  /\bנווה שרון\b/g,
+  /\bנווה[-\s]*שרון\b/g,
+  /\bנוה שרון\b/g,
+  /\bשכונת נווה שרון\b/g,
+  /\bנ"ש\b/g,
+
+  // קרית מנחם
+  /\bקרית מנחם\b/g,
+  /\bקריית מנחם\b/g,
+  /\bקרית[-\s]*מנחם\b/g,
+  /\bקמ\b/g,
+
+  // מערב נתיבות / השכונה המערבית
+  /\bמערב נתיבות\b/g,
+  /\bנתיבות מערב\b/g,
+  /\bמערב[-\s]*נתיבות\b/g,
+  /\bהשכונה המערבית\b/g,
+  /\bשכונה מערבית\b/g,
+  /\bש"מ\b/g,
+
+  // החורש
+  /\bשכונת החורש\b/g,
+  /\bשכו'? ?החורש\b/g,
+  /\bשכ'? ?החורש\b/g,
+  /\bהחורשה\b/g,
+  // "החורש" o "חורש" como barrio (no como calle)
+  /\bהחורש\b/g,
+  /\bחורש\b/g,
+
+  // נטעים
+  /\bנטעים נתיבות\b/g,
+  /\bאזור נטעים\b/g,
+  /\bשכונת נטעים\b/g,
+  /\bנטעים[-\s]*נתיבות\b/g,
+  /\bנטעים\b/g,
+
+  // נווה אביב
+  /\bנווה אביב\b/g,
+  /\bנוה אביב\b/g,
+  /\bשכונת נווה אביב\b/g,
+  /\bאביב נתיבות\b/g,
+
+  // יוספטל
+  /\bיוספטל דרום\b/g,
+  /\bשכונת יוספטל\b/g,
+  /\bיוספטל\b/g,
+  /\bש"י\b/g,
+
+  // גבעת בית ואן
+  /\bגבעת בית ואן\b/g,
+  /\bבית ואן\b/g,
+  /\bגבעת בון\b/g,
+
+  // רמות יורם
+  /\bרמות יורם\b/g,
+  /\bשכונת רמות יורם\b/g,
+  /\bיורם\b/g,
+];
+
+/**
+ * Elimina nombres de barrios conocidos de Netivot de la parte de dirección.
+ * La ciudad "נתיבות" se maneja por separado y NUNCA se elimina aquí.
+ */
+function stripNeighborhoodTokens(value: string): string {
+  let result = value;
+
+  for (const pattern of NEIGHBORHOOD_PATTERNS) {
+    result = result.replace(pattern, " ");
+  }
+
+  return normalizeWhitespaceAndCommas(result);
+}
+
 // ---------------------------------------------
 // Address extraction from row (fixed & clean)
 // ---------------------------------------------
@@ -84,9 +166,12 @@ export function getAddressFromRow(data: Record<string, any>): string {
 
   const cityKey = findKeyByPattern(data, k => /(עיר|city)/i.test(k));
 
-  const neighborhoodKey = findKeyByPattern(data, k =>
-    /(שכונה|neighborhood)/i.test(k)
-  );
+  // A PROPÓSITO ignoramos el barrio en la dirección que se manda
+  // a geocoding. Solo nos interesa: calle + número + נתיבות.
+  // Si en el Excel hay columna de barrio, se puede usar en UI, pero no aquí.
+  // const neighborhoodKey = findKeyByPattern(data, k =>
+  //   /(שכונה|neighborhood)/i.test(k)
+  // );
 
   const parts: string[] = [];
 
@@ -98,9 +183,10 @@ export function getAddressFromRow(data: Record<string, any>): string {
     parts.push(String(data[numberKey]).trim());
   }
 
-  if (neighborhoodKey && data[neighborhoodKey]) {
-    parts.push(String(data[neighborhoodKey]).trim());
-  }
+  // Ignoramos explícitamente el barrio en la cadena base:
+  // if (neighborhoodKey && data[neighborhoodKey]) {
+  //   parts.push(String(data[neighborhoodKey]).trim());
+  // }
 
   // City fallback logic
   if (cityKey && data[cityKey]) {
@@ -128,56 +214,62 @@ export function normalizeAddress(raw: string): string | null {
 
   normalized = normalizeWhitespaceAndCommas(normalized);
 
-  // 2) Aplicar diccionario de reemplazos conocidos (barrios, variantes, etc.)
+  // 2) Aplicar diccionario de reemplazos conocidos (variantes, etc.)
   normalized = applyReplacementDictionary(normalized);
 
   // 3) Quitar prefijos de calle redundantes
   normalized = stripStreetPrefixes(normalized);
 
-  // 4) Asegurar presencia de "נתיבות" cuando hay barrios de Netivot
-  const hasNetivot = /נתיבות/.test(normalized);
-  const hasNetivotNeighborhood = /(נווה נוי|נווה שרון|קרית מנחם|קריית מנחם|שכונת החורש)/.test(
-    normalized
-  );
-
-  if (!hasNetivot && hasNetivotNeighborhood) {
-    normalized = `${normalized} נתיבות`;
+  // 4) Si no aparece "נתיבות", no aplicamos lógica especial de Netivot.
+  // Esto evita romper direcciones de otras ciudades.
+  if (!/נתיבות/.test(normalized)) {
+    return normalized;
   }
 
-  // 5) Evitar duplicados tipo "נתיבות נתיבות"
-  normalized = normalized.replace(/\b(נתיבות)(?:\s+\1)+\b/g, "נתיבות");
-
-  // 6) Forzar formato "רחוב מספר, נתיבות" cuando hay número y Netivot
-  const hasNumber = /\d+/.test(normalized);
-
-  if (hasNumber && /נתיבות/.test(normalized)) {
-    // Ej: "שליו 2 נתיבות" -> "שליו 2, נתיבות"
-    normalized = normalized.replace(
-      /^(.+?\d+)\s+(נתיבות.*)$/,
-      (_match, addrPart, cityPart) => {
-        return `${String(addrPart).trim()}, ${String(cityPart).trim()}`;
-      }
-    );
+  // 5) Tomamos SIEMPRE la ÚLTIMA ocurrencia de "נתיבות" como ciudad.
+  const lastIndex = normalized.lastIndexOf("נתיבות");
+  if (lastIndex === -1) {
+    return normalized;
   }
 
-  // 7) Detección de direcciones incompletas
-  //    Regla dura del negocio:
-  //    - Si es solo ciudad ("נתיבות") o solo nombre de calle sin número,
-  //      NO geocodificar → devolver null para que la app marque
-  //      "חסרה כתובת מלאה" y deje lat/lon vacíos.
+  let addressPart = normalized.slice(0, lastIndex).trim();
+  const cityPart = "נתיבות";
 
-  const hebrewOnly = /^[\u0590-\u05FF\s'"-]+$/;
+  // 6) Eliminar tokens de barrios CONOCIDOS de la parte de dirección.
+  // Queremos solo: calle + número.
+  addressPart = stripNeighborhoodTokens(addressPart);
 
-  if (hebrewOnly.test(normalized) && !hasNumber) {
-    // Ejemplos: "נתיבות", "הרב צבאן", "קרית מנחם נתיבות"
+  // 7) Limpiar comas y espacios redundantes otra vez
+  addressPart = normalizeWhitespaceAndCommas(addressPart);
+  addressPart = addressPart.replace(/[,\s]+$/, "");
+
+  // 8) Mantener solo hasta el ÚLTIMO número encontrado.
+  // Esto corta cualquier texto basura después del número
+  // (ej: "חיל הנדסה 18 נטעים").
+  const upToLastNumberMatch = addressPart.match(/^(.*\d+)/);
+  if (upToLastNumberMatch) {
+    addressPart = upToLastNumberMatch[1].trim();
+  }
+
+  // 9) Extraer calle y número.
+  // Formato esperado: "<calle> <número>"
+  const streetNumberMatch = addressPart.match(/^(.+?)\s+(\d+)\s*$/);
+  if (!streetNumberMatch) {
+    // No hay número → dirección incompleta.
+    // La app, al recibir null, debe marcar "חסרה כתובת מלאה" y dejar lat/lon vacíos.
     return null;
   }
 
-  // 8) Si no hay ningún token útil, consideramos que no hay dirección
-  const tokenCount = normalized.split(" ").filter(Boolean).length;
-  if (tokenCount === 0) {
+  const street = streetNumberMatch[1].trim();
+  const houseNumber = streetNumberMatch[2].trim();
+
+  if (!street || !houseNumber) {
     return null;
   }
 
-  return normalized;
+  // 10) Construir el formato FINAL para geocoding:
+  // SOLO calle + número + Netivot (como definimos).
+  const finalAddress = `${street} ${houseNumber}, ${cityPart}`;
+
+  return finalAddress;
 }

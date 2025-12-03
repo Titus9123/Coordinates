@@ -62,7 +62,8 @@ function classifyRowFromCache(row: AddressRow, allowNotFound: boolean): AddressR
     row.status === ProcessingStatus.SKIPPED ||
     row.status === ProcessingStatus.CONFIRMED ||
     row.status === ProcessingStatus.UPDATED ||
-    row.status === ProcessingStatus.NOT_FOUND
+    row.status === ProcessingStatus.NOT_FOUND ||
+    row.status === ProcessingStatus.NEEDS_REVIEW
   ) {
     return row;
   }
@@ -110,11 +111,12 @@ function classifyRowFromCache(row: AddressRow, allowNotFound: boolean): AddressR
       };
     }
 
+    // Dirección completa, pero el ג'אוקודר no devuelve nada → לבדיקה, no "לא נמצא"
     return {
       ...row,
-      status: ProcessingStatus.NOT_FOUND,
+      status: ProcessingStatus.NEEDS_REVIEW,
       finalCoords: undefined,
-      message: "לא נמצא במפה",
+      message: "כתובת מלאה אך לא נמצאה במאגר המיפוי – נדרש טיפול ידני",
     };
   }
 
@@ -271,7 +273,7 @@ function App() {
       applyPartialResults();
     });
 
-    // 4) Pasada final: lo que siga pendiente se resuelve a CONFIRMED / NOT_FOUND
+    // 4) Pasada final: lo que siga pendiente se resuelve a CONFIRMED / NEEDS_REVIEW
     setRows((prev) => prev.map((row) => classifyRowFromCache(row, true)));
 
     setIsProcessing(false);
@@ -350,7 +352,7 @@ function App() {
                 <div>
                   <h2 className="text-lg font-semibold">{fileName}</h2>
                   <div className="text-sm text-gray-500 flex gap-4 mt-1">
-                    <span>סה"כ שורות: {rows.length}</span>
+                    <span>סה"כ shורות: {rows.length}</span>
                     <span>כתובות ייחודיות: {totalUnique || "-"}</span>
                     <span>בקשות API: {apiRequestsCount}</span>
                   </div>
