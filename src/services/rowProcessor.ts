@@ -1,10 +1,10 @@
 import { getAddressFromRow, normalizeAddress } from "./normalization";
 
 export type RowStatus =
-  | "UPDATED"          // עודכנו בהצלחה
-  | "CONFIRMED"        // כתובת תקינה, coords מקור נשמרו
-  | "NOT_FOUND"        // לא נמצאו
-  | "SKIPPED_MISSING"; // דולגו (מידע חסר)
+  | "UPDATED" // הקואורדינטות עודכנו
+  | "CONFIRMED" // כתובת תקינה, הקואורדינטות המקוריות סבירות
+  | "NOT_FOUND" // כתובת מלאה אך לא נמצאה במיפוי
+  | "SKIPPED_MISSING"; // חסרה כתובת מלאה
 
 export type ProcessedRow = {
   status: RowStatus;
@@ -27,6 +27,41 @@ type SourceRow = {
   rawData: Record<string, any>;
 };
 
+/**
+ * Decide si una dirección es incompleta (no se puede geocodificar de forma fiable).
+ *
+ * Casos típicos:
+ * - vacío
+ * - solo "נתיבות" / "Netivot"
+ * - algo muy corto sin número ni palabra de calle (ej: "הרב צבאן", "סשה ארגוב")
+ */
+function isIncompleteAddress(normalized: string): boolean {
+  const trimmed = normalized.trim();
+  if (!trimmed) return true;
+
+  const noSpaces = trimmed.replace(/\s+/g, "").toLowerCase();
+  if (noSpaces === "נתיבות" || noSpaces === "netivot") {
+    return true;
+  }
+
+  const hasNumber = /\d+/.test(trimmed);
+  const hasStreetKeyword = /(רחוב|שכונת|שכו'|שכונה|שד'|כיכר|כביש)/.test(trimmed);
+
+  // Sin número y sin palabra de calle/barrio → probablemente es solo un nombre
+  if (!hasNumber && !hasStreetKeyword) {
+    const parts = trimmed.split(/\s+/);
+    if (parts.length <= 2) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Procesa una fila de origen y devuelve el resultado de geocodificación +
+ * estado lógico, sin confiar en las coordenadas originales para validar.
+ */
 export async function processRow(
   row: SourceRow,
   geocodeFn: (address: string) => Promise<GeocodeResult>,
@@ -35,109 +70,87 @@ export async function processRow(
   const address = getAddressFromRow(row.rawData);
   const normalized = normalizeAddress(address);
 
-  // 1) Sin dirección usable → דולגו (מידע חסר)
-  if (!normalized) {
-    return {
-      status: "SKIPPED_MISSING",
-      message: "חסרה כתובת מלאה",
-      originalLat: row.originalLat,
-      originalLon: row.originalLon,
-      newLat: null,
-      newLon: null,
-    };
-  }
-
-  // 2) Dirección sin número → también מידע חסר (no quemamos requests)
-  const hasNumber = /\d+/.test(normalized);
-  if (!hasNumber) {
-    return {
-      status: "SKIPPED_MISSING",
-      message: "חסרה כתובת מלאה (אין מספר בית)",
-      originalLat: row.originalLat,
-      originalLon: row.originalLon,
-      newLat: null,
-      newLon: null,
-    };
-  }
-
-  // 3) Solo aquí llamamos a la API de geocoding
-  const result = await geocodeFn(normalized);
-
   const origLat = row.originalLat;
   const origLon = row.originalLon;
 
-  const origInside =
+  // 1) Sin dirección usable → חסרה כתובת מלאה
+  if (!normalized || isIncompleteAddress(normalized)) {
+    return {
+      status: "SKIPPED_MISSING",
+      message: "חסרה כתובת מלאה",
+      originalLat: origLat,
+      originalLon: origLon,
+      newLat: null,
+      newLon: null,
+    };
+  }
+
+  // 2) Dirección completa → intentamos geocoding
+  const result = await geocodeFn(normalized);
+
+  // 2A) No hay resultado del geocoder → dirección completa pero el mapa no la conoce
+  if (!result) {
+    return {
+      status: "NOT_FOUND",
+      message: "כתובת מלאה אך לא נמצאה במאגר המיפוי – נדרש טיפול ידני",
+      originalLat: origLat,
+      originalLon: origLon,
+      newLat: null,
+      newLon: null,
+    };
+  }
+
+  const newLat = result.lat;
+  const newLon = result.lon;
+  const newInside = isInsideNetivot(newLat, newLon);
+
+  // 2B) Resultado fuera de Netivot → no lo aceptamos
+  if (!newInside) {
+    return {
+      status: "NOT_FOUND",
+      message: "כתובת מלאה אך לא נמצאה במאגר המיפוי – נדרש טיפול ידני",
+      originalLat: origLat,
+      originalLon: origLon,
+      newLat: null,
+      newLon: null,
+    };
+  }
+
+  // 3) Resultado dentro de Netivot → ahora decidimos UPDATED vs CONFIRMED
+  let status: RowStatus = "UPDATED";
+  let message = "הקואורדינטות עודכנו בהצלחה";
+
+  // Si también hay coords originales y están MUY cerca y dentro de נתיבות,
+  // podemos considerarlas "confirmadas" y no como cambio fuerte.
+  if (
     typeof origLat === "number" &&
     typeof origLon === "number" &&
-    isInsideNetivot(origLat, origLon);
-
-  if (!result) {
-    // 4A) No hay resultado de API
-    if (origInside) {
-      // Dirección y coords originales dentro de נתיבות → la damos por buena
+    isInsideNetivot(origLat, origLon)
+  ) {
+    const dist = distanceMeters(origLat, origLon, newLat, newLon);
+    if (dist <= 30) {
+      status = "CONFIRMED";
+      message = "הקואורדינטות המקוריות תקינות (שינוי זניח)";
+      // Podemos dejar newLat/newLon como null si quieres conservar solo las originales en la exportación:
       return {
-        status: "CONFIRMED",
-        message: "כתובת תקינה – נעשה שימוש בקואורדינטות המקור",
+        status,
+        message,
         originalLat: origLat,
         originalLon: origLon,
         newLat: null,
         newLon: null,
       };
     }
-
-    // 4B) Nada dentro de נתיבות → realmente לא נמצא
-    return {
-      status: "NOT_FOUND",
-      message: "לא נמצאה התאמה במפה לכתובת",
-      originalLat: origLat,
-      originalLon: origLon,
-      newLat: null,
-      newLon: null,
-    };
   }
 
-  // 5) Hay resultado de API
-  const newLat = result.lat;
-  const newLon = result.lon;
-  const newInside = isInsideNetivot(newLat, newLon);
-
-  if (!newInside && origInside) {
-    // API te llevó fuera de נתיבות → nos quedamos con la original
-    return {
-      status: "CONFIRMED",
-      message: "תוצאת המפה מחוץ לנתיבות – נשמרו קואורדינטות המקור",
-      originalLat: origLat,
-      originalLon: origLon,
-      newLat: null,
-      newLon: null,
-    };
-  }
-
-  // Aquí puedes añadir un cálculo de distancia para decidir si es realmente “UPDATED”
-  const isFar =
-    origLat != null &&
-    origLon != null &&
-    distanceMeters(origLat, origLon, newLat, newLon) > 30; // por ejemplo 30m
-
-  if (isFar) {
-    return {
-      status: "UPDATED",
-      message: "הקואורדינטות עודכנו בהצלחה",
-      originalLat: origLat,
-      originalLon: origLon,
-      newLat,
-      newLon,
-    };
-  }
-
-  // Está muy cerca → tratamos como CONFIRMED, sin cambiar apenas nada
+  // Por defecto → actualizamos con las nuevas coordenadas
   return {
-    status: "CONFIRMED",
-    message: "הקואורדינטות המקוריות תקינות (שינוי זניח)",
+    status,
+    message,
     originalLat: origLat,
     originalLon: origLon,
-    newLat: null,
-    newLon: null,
+    newLat,
+    newLon,
   };
 }
 

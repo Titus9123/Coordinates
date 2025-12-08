@@ -243,6 +243,24 @@ export function normalizeAddress(raw: string): string | null {
   addressPart = normalizeWhitespaceAndCommas(addressPart);
   addressPart = addressPart.replace(/[,\s]+$/, "");
 
+  // 7.1) Manejar rangos de número de casa del tipo "9-11", "11-9", "6-8".
+  // Convertimos el rango a su punto medio para geocoding.
+  const rangeMatch = addressPart.match(/^(.+?)\s+(\d+)\s*-\s*(\d+)\s*$/);
+  if (rangeMatch) {
+    const streetBase = rangeMatch[1].trim();
+    const start = parseInt(rangeMatch[2], 10);
+    const end = parseInt(rangeMatch[3], 10);
+
+    if (!Number.isNaN(start) && !Number.isNaN(end)) {
+      const middle = Math.round((start + end) / 2);
+      addressPart = `${streetBase} ${middle}`;
+    }
+  }
+
+  // 7.2) Quitar sufijos de departamento tipo "13/1", "13 / 01" al final.
+  // Nos quedamos solo con el número principal de la casa.
+  addressPart = addressPart.replace(/(\d+)\s*\/\s*\d+\s*$/, "$1");
+
   // 8) Mantener solo hasta el ÚLTIMO número encontrado.
   // Esto corta cualquier texto basura después del número
   // (ej: "חיל הנדסה 18 נטעים").
@@ -272,4 +290,73 @@ export function normalizeAddress(raw: string): string | null {
   const finalAddress = `${street} ${houseNumber}, ${cityPart}`;
 
   return finalAddress;
+}
+
+// ---------------------------------------------
+// New helper: extract street & number for UI
+// ---------------------------------------------
+
+/**
+ * Extrae calle y número de una dirección (normalizada o cruda).
+ *
+ * Ejemplos:
+ *  "התאנה 2, נתיבות"        -> { street: "התאנה", number: "2" }
+ *  "נווה נוי, ערבה 4, נתיבות" -> { street: "ערבה",   number: "4" }
+ *  "הרב מזוז 8"              -> { street: "הרב מזוז", number: "8" }
+ *  "הרב צבאן"                -> { street: "הרב צבאן", number: null }
+ */
+export function extractStreetAndNumber(
+  rawAddress: string
+): { street: string; number: string | null } {
+  if (!rawAddress) {
+    return { street: "", number: null };
+  }
+
+  // 1) Normalizar espacios y comas
+  let value = normalizeWhitespaceAndCommas(rawAddress);
+
+  // 2) Quitar ciudad al final tipo ", נתיבות" o variantes similares
+  value = value.replace(/,\s*נתיבות.*$/g, "").trim();
+
+  // 3) Si hay varias partes separadas por coma, nos quedamos con la última
+  // relevante (normalmente "רחוב מספר", después del barrio).
+  const partsByComma = value.split(",");
+  let mainPart = partsByComma[partsByComma.length - 1].trim();
+  if (!mainPart && partsByComma.length > 1) {
+    // fallback: si la última está vacía por algún motivo, usar la anterior
+    mainPart = partsByComma[partsByComma.length - 2].trim();
+  }
+
+  // 4) Quitar prefijos de calle (רחוב, רח', רח)
+  mainPart = stripStreetPrefixes(mainPart);
+
+  // 5) Eliminar tokens de barrios conocidos si se colaron aquí
+  mainPart = stripNeighborhoodTokens(mainPart);
+
+  // 6) Normalizar otra vez por si quedó algo raro
+  mainPart = normalizeWhitespaceAndCommas(mainPart);
+
+  if (!mainPart) {
+    return { street: "", number: null };
+  }
+
+  // 7) Dividir por espacios y analizar el último token
+  const tokens = mainPart.split(/\s+/);
+  const last = tokens[tokens.length - 1];
+
+  // Números tipo "12" o "12א"
+  const numberRegex = /^\d+[א-ת]?$/
+
+  if (numberRegex.test(last)) {
+    const streetName = tokens.slice(0, -1).join(" ").trim();
+    const number = last.trim();
+    if (!streetName) {
+      // Caso raro: solo número, lo tratamos como sin calle
+      return { street: "", number: number };
+    }
+    return { street: streetName, number };
+  }
+
+  // 8) Si no hay número claro, devolvemos todo como calle
+  return { street: mainPart, number: null };
 }
