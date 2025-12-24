@@ -1,6 +1,10 @@
 import { Coordinates } from "../types";
 import { NOMINATIM_BASE_URL, NETIVOT_BOUNDS } from "../constants";
 import { geocodeWithGovmap } from "./govmapService";
+import { GISService } from "./gisService";
+import { HybridGeocoder } from "./hybridGeocoder";
+import { normalizeStreetText } from "./normalization";
+import { enqueueIngest } from "./ingestClient";
 
 const geocodeCache = new Map<string, Coordinates>();
 
@@ -98,6 +102,9 @@ function stripCityTokens(raw: string): string {
  * Detecta si el texto describe una intersección tipo:
  * - "רחוב א / רחוב ב"
  * - "רחוב א פינת רחוב ב"
+ * 
+ * Uses normalizeStreetText() for consistent street name normalization when
+ * constructing intersection queries.
  */
 function detectIntersection(raw: string): string | null {
   const withoutCity = stripCityTokens(raw);
@@ -105,8 +112,8 @@ function detectIntersection(raw: string): string | null {
 
   const slashMatch = normalized.match(/^(.+?\D)\s*[\/\\]\s*(\D.+)$/);
   if (slashMatch) {
-    const street1 = slashMatch[1].trim();
-    const street2 = slashMatch[2].trim();
+    const street1 = normalizeStreetText(slashMatch[1].trim());
+    const street2 = normalizeStreetText(slashMatch[2].trim());
     if (street1 && street2) {
       return `${street1} & ${street2}`;
     }
@@ -114,8 +121,8 @@ function detectIntersection(raw: string): string | null {
 
   const pinatMatch = normalized.match(/^(.+?)\s*פינת\s+(.+)$/);
   if (pinatMatch) {
-    const street1 = pinatMatch[1].trim();
-    const street2 = pinatMatch[2].trim();
+    const street1 = normalizeStreetText(pinatMatch[1].trim());
+    const street2 = normalizeStreetText(pinatMatch[2].trim());
     if (street1 && street2) {
       return `${street1} & ${street2}`;
     }
@@ -270,7 +277,7 @@ async function geocodeWithNominatim(normalizedAddress: string): Promise<Coordina
 /**
  * Geocoder híbrido: GovMap primero, luego Nominatim.
  */
-async function geocodeNetivot(normalizedAddress: string): Promise<Coordinates | null> {
+export async function geocodeNetivot(normalizedAddress: string): Promise<Coordinates | null> {
   // 1) GovMap (base oficial de ישראל)
   const govResult = await geocodeWithGovmap(normalizedAddress);
   if (govResult && !Number.isNaN(govResult.lat) && !Number.isNaN(govResult.lon)) {
@@ -325,7 +332,7 @@ export async function batchGeocode(
 }
 
 /* ------------------------------------------------------------------
- * BÚSQUEDA MANUAL DE DIRECCIONES EN NETIVOT (OpenStreetMap / Nominatim)
+ * BÚSQUEDA MANUAL DE DIRECCIONES EN NETIVOT (GIS-based)
  * -----------------------------------------------------------------*/
 
 export interface NetivotAddressSuggestion {
@@ -337,61 +344,155 @@ export interface NetivotAddressSuggestion {
   lon: number;
 }
 
+/**
+ * Tracks whether GIS layer has been loaded for search functionality.
+ */
+let gisSearchInitialized = false;
+
+/**
+ * Ensures GIS layer is loaded for search functionality.
+ * This is a lightweight initialization that only loads if not already loaded.
+ * 
+ * Note: If HybridGeocoder.init() has already been called, the GIS layer
+ * should already be loaded. This function will attempt to load it if needed,
+ * but will gracefully handle cases where it's already loaded.
+ */
+async function ensureGISSearchInitialized(): Promise<void> {
+  // #region agent log
+  enqueueIngest({location:'geocoding.ts:354',message:'ensureGISSearchInitialized called',data:{gisSearchInitialized},sourceFile:'geocoding.ts',sourceFn:'ensureGISSearchInitialized'});
+  // #endregion
+  if (!gisSearchInitialized) {
+    try {
+      // Try to load the address points layer (for geocoding)
+      // If HybridGeocoder.init() was already called, this might fail
+      // or be a no-op, which is fine - we'll catch and continue
+      // #region agent log
+      enqueueIngest({location:'geocoding.ts:360',message:'Before GISService.loadLayer in ensureGISSearch',data:{},sourceFile:'geocoding.ts',sourceFn:'ensureGISSearchInitialized'});
+      // #endregion
+      await GISService.loadLayer("/public/gis/netivot.geojson");
+      // #region agent log
+      enqueueIngest({location:'geocoding.ts:363',message:'After GISService.loadLayer in ensureGISSearch',data:{},sourceFile:'geocoding.ts',sourceFn:'ensureGISSearchInitialized'});
+      // #endregion
+      
+      // Load the street segments layer (for street search)
+      await GISService.ensureStreetSegmentsLoaded("/public/gis/שמות_רחובות_2025.geojson");
+      // #region agent log
+      enqueueIngest({location:'geocoding.ts:366',message:'After ensureStreetSegmentsLoaded in ensureGISSearch',data:{},sourceFile:'geocoding.ts',sourceFn:'ensureGISSearchInitialized'});
+      // #endregion
+      
+      gisSearchInitialized = true;
+    } catch (error) {
+      // #region agent log
+      enqueueIngest({location:'geocoding.ts:369',message:'ensureGISSearchInitialized error caught',data:{errorMessage:error instanceof Error?error.message:String(error)},sourceFile:'geocoding.ts',sourceFn:'ensureGISSearchInitialized'});
+      // #endregion
+      // If load fails, it might be because:
+      // 1. Layer is already loaded (some implementations might throw)
+      // 2. File doesn't exist
+      // 3. Network error
+      // In any case, we'll try to use searchStreets which will return empty
+      // if the layer isn't actually loaded
+      console.warn("GIS layer load attempt failed (may already be loaded):", error);
+      // Mark as initialized anyway to avoid repeated load attempts
+      gisSearchInitialized = true;
+    }
+  }
+}
+
 export async function searchNetivotAddresses(query: string): Promise<NetivotAddressSuggestion[]> {
   const trimmed = query.trim();
-  if (!trimmed) return [];
-
-  const fullQuery = `${trimmed} נתיבות, ישראל`;
-  const viewbox = getNetivotViewboxParam();
-
-  const url =
-    `${NOMINATIM_BASE_URL}` +
-    `?q=${encodeURIComponent(fullQuery)}` +
-    `&format=json` +
-    `&addressdetails=1` +
-    `&accept-language=he` +
-    `&countrycodes=il` +
-    `&limit=10` +
-    `&viewbox=${encodeURIComponent(viewbox)}` +
-    `&bounded=1`;
+  
+  // Return empty list if query is too short
+  if (!trimmed || trimmed.length < 2) {
+    return [];
+  }
 
   try {
-    const resp = await fetch(url);
-    if (!resp.ok) {
-      console.error("Nominatim search failed", resp.status);
-      return [];
-    }
+    // Ensure GIS is initialized
+    await ensureGISSearchInitialized();
 
-    const data = await resp.json();
-    const rawResults: any[] = Array.isArray(data) ? data : [];
+    // Search for streets using GIS
+    const streets = GISService.searchStreets(trimmed, 20);
 
-    return rawResults
-      .map((item: any, index: number) => {
-        const lat = parseFloat(item.lat);
-        const lon = parseFloat(item.lon);
-        if (Number.isNaN(lat) || Number.isNaN(lon)) {
-          return null;
-        }
-
-        const insideBounds = isWithinNetivotBounds(lat, lon);
-        const netivotByName = isNetivotByName(item);
-
-        if (!insideBounds && !netivotByName) {
-          return null;
-        }
-
-        return {
-          id: String(item.place_id ?? index),
-          displayName: String(item.display_name ?? fullQuery),
-          x: 0,
-          y: 0,
-          lat,
-          lon,
-        } as NetivotAddressSuggestion;
-      })
-      .filter((v): v is NetivotAddressSuggestion => v !== null);
+    // Map GIS street results to NetivotAddressSuggestion format
+    // The UI expects this format and will extract street names from displayName
+    return streets.map((street, index) => ({
+      id: `gis-street-${index}-${street.streetName}`,
+      displayName: street.streetName,
+      x: 0,
+      y: 0,
+      lat: 0, // Coordinates not needed for street search
+      lon: 0, // Coordinates not needed for street search
+    }));
   } catch (error) {
     console.error("searchNetivotAddresses error:", error);
+    // Return empty array on error instead of throwing
     return [];
+  }
+}
+
+/* ------------------------------------------------------------------
+ * MANUAL COORDINATE LOOKUP FOR NETIVOT ADDRESSES
+ * -----------------------------------------------------------------*/
+
+/**
+ * Tracks whether HybridGeocoder has been initialized for manual lookup.
+ */
+let manualGeocoderInitialized = false;
+
+/**
+ * Ensures HybridGeocoder is initialized for manual coordinate lookup.
+ * This function is idempotent - it only initializes once.
+ */
+async function ensureManualGeocoderInitialized(): Promise<void> {
+  if (!manualGeocoderInitialized) {
+    try {
+      await HybridGeocoder.init();
+      manualGeocoderInitialized = true;
+    } catch (error) {
+      console.error("Failed to initialize HybridGeocoder for manual lookup:", error);
+      throw error;
+    }
+  }
+}
+
+/**
+ * Finds coordinates for a Netivot address (street + house number).
+ * 
+ * This is a thin wrapper around HybridGeocoder that:
+ * - Ensures HybridGeocoder is initialized
+ * - Calls HybridGeocoder.geocode() with the street name and house number
+ * - Returns Coordinates | null (extracts lat/lon from HybridGeocodingResult)
+ * 
+ * @param streetName - Street name (e.g. "רפיח ים")
+ * @param houseNumber - House number (e.g. 12)
+ * @returns Coordinates object with lat/lon, or null if not found
+ * @throws Error only for unexpected errors (not for "not found" cases)
+ */
+export async function findNetivotAddressCoords(
+  streetName: string,
+  houseNumber: number
+): Promise<Coordinates | null> {
+  try {
+    // Ensure HybridGeocoder is initialized
+    await ensureManualGeocoderInitialized();
+    
+    // Call HybridGeocoder.geocode()
+    const result = await HybridGeocoder.geocode(streetName, houseNumber);
+    
+    // If result is null, return null (not found)
+    if (result === null) {
+      return null;
+    }
+    
+    // Extract and return coordinates
+    return {
+      lat: result.lat,
+      lon: result.lon,
+    };
+  } catch (error) {
+    // Log unexpected errors
+    console.error("Error in findNetivotAddressCoords:", error);
+    // Re-throw unexpected errors (not "not found" cases)
+    throw error;
   }
 }

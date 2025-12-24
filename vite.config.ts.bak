@@ -9,15 +9,6 @@ export default defineConfig({
       '/api/govmap': {
         target: 'http://localhost:4000',
         changeOrigin: true,
-        rewrite: (path) => {
-          // Remove /api/govmap prefix to avoid path duplication
-          return path.replace(/^\/api\/govmap/, '');
-        },
-        configure: (proxy, _options) => {
-          proxy.on('error', (err, _req, _res) => {
-            console.error('GovMap proxy error:', err);
-          });
-        },
       },
       '/api/nominatim': {
         target: 'https://nominatim.openstreetmap.org',
@@ -33,6 +24,13 @@ export default defineConfig({
           });
           proxy.on('proxyReq', (proxyReq, req, _res) => {
             proxyReq.setHeader('User-Agent', 'Coordinates-Geocoding-App/1.0');
+          });
+        },
+      },
+      '/api/govmap': {
+        configure: (proxy, _options) => {
+          proxy.on('error', (err, _req, _res) => {
+            console.error('GovMap proxy error:', err);
           });
         },
       },

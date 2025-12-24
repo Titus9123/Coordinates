@@ -7,25 +7,36 @@ const PORT = 4000;
 app.use(cors());
 app.use(express.json());
 
-app.get("/api/govmap/geocode", (req, res) => {
-  const q = String(req.query.q || "").trim();
+// Shared response handler for both GET and POST
+function handleGeocodeRequest(q) {
+  const trimmedQ = String(q || "").trim();
 
-  if (!q) {
-    return res.json({ results: [] });
+  if (!trimmedQ) {
+    return { results: [] };
   }
 
-  const results = [
-    {
-      id: 1,
-      address: q,
-      X: 0,
-      Y: 0,
-      Lat: 31.418,
-      Lon: 34.595
-    }
-  ];
+  return {
+    results: [
+      {
+        id: 1,
+        address: trimmedQ,
+        X: 0,
+        Y: 0,
+        Lat: 31.418,
+        Lon: 34.595
+      }
+    ]
+  };
+}
 
-  res.json({ results });
+app.get("/geocode", (req, res) => {
+  const q = String(req.query.q || "").trim();
+  res.json(handleGeocodeRequest(q));
+});
+
+app.post("/geocode", (req, res) => {
+  const q = String(req.body?.q || "").trim();
+  res.json(handleGeocodeRequest(q));
 });
 
 app.listen(PORT, () => {

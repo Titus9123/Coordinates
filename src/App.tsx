@@ -10,18 +10,20 @@ import {
   RefreshCw,
   Search,
 } from "lucide-react";
-import { AddressRow, ProcessingStatus } from "./types";
-import { readExcel, exportExcel } from "./services/excel";
+import { AddressRow, ProcessingStatus, Coordinates } from "./types";
+import { readExcel, exportExcel, processExcelFile } from "./services/excel";
 import {
   normalizeAddress,
   getAddressFromRow,
   extractStreetAndNumber,
 } from "./services/normalization";
 import {
-  batchGeocode,
   getCachedResult,
   searchNetivotAddresses,
+  findNetivotAddressCoords,
 } from "./services/geocoding";
+import { GISService } from "./services/gisService";
+import { enqueueIngest } from "./services/ingestClient";
 
 // --------------------------------------------------
 // Helper: simple Netivot bounding box (approximate)
@@ -192,7 +194,10 @@ function isMissingFullAddress(rawAddress: string | null | undefined): boolean {
 
 // --------------------------------------------------
 // Helper: clasificar una fila según el cache (parcial/final)
+// NOTE: This function is no longer used - replaced by rowProcessor.ts logic
+// Keeping for reference but marked as unused to avoid linter warnings
 // --------------------------------------------------
+// @ts-ignore - Unused function kept for reference
 function classifyRowFromCache(
   row: AddressRow,
   allowNotFound: boolean
@@ -342,6 +347,8 @@ function App() {
   const [rows, setRows] = useState<AddressRow[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [fileName, setFileName] = useState("");
+  const [uploadedFile, setUploadedFile] = useState<File | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [processedUnique, setProcessedUnique] = useState(0);
   const [totalUnique, setTotalUnique] = useState(0);
   const [apiRequestsCount, setApiRequestsCount] = useState(0);
@@ -357,11 +364,17 @@ function App() {
 
   const [numberQuery, setNumberQuery] = useState("");
   const [numberSuggestions, setNumberSuggestions] = useState<string[]>([]);
+  const [allHouseNumbers, setAllHouseNumbers] = useState<string[]>([]); // All house numbers for selected street
   const [selectedNumber, setSelectedNumber] = useState<string | null>(null);
 
   const [isStreetLoading, setIsStreetLoading] = useState(false);
   const [isNumberLoading, setIsNumberLoading] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
+
+  // Manual coordinate lookup state
+  const [manualCoords, setManualCoords] = useState<Coordinates | null>(null);
+  const [manualCoordsError, setManualCoordsError] = useState<string | null>(null);
+  const [isManualCoordsLoading, setIsManualCoordsLoading] = useState(false);
 
   // ------------------------------------------------------------------
   // Handlers GovMap: calle
@@ -403,41 +416,136 @@ function App() {
   // ------------------------------------------------------------------
   // Handlers GovMap: número
   // ------------------------------------------------------------------
-  const performNumberSearch = async (street: string, numberPart: string) => {
-    const qPart = numberPart.trim();
-    if (!street || !qPart) {
+  const loadHouseNumbersForStreet = async (street: string) => {
+    // #region agent log
+    enqueueIngest({location:'App.tsx:409',message:'loadHouseNumbersForStreet called',data:{street},sourceFile:'App.tsx',sourceFn:'loadHouseNumbersForStreet'});
+    // #endregion
+    if (!street) {
       setNumberSuggestions([]);
+      setAllHouseNumbers([]);
       return;
     }
 
     try {
       setIsNumberLoading(true);
       setSearchError(null);
-      const results = await searchNetivotAddresses(`${street} ${qPart}`);
-
-      const numbersSet = new Set<string>();
-      for (const item of results) {
-        const { street: s, number } = extractStreetAndNumber(
-          item.displayName
-        );
-        if (s === street && number) {
-          numbersSet.add(number);
-        }
-      }
-
-      const nums = Array.from(numbersSet).sort((a, b) => {
+      
+      // Ensure address layer is loaded
+      // #region agent log
+      enqueueIngest({location:'App.tsx:421',message:'Before GISService.loadLayer in loadHouseNumbers',data:{street},sourceFile:'App.tsx',sourceFn:'loadHouseNumbersForStreet'});
+      // #endregion
+      await GISService.loadLayer("/public/gis/netivot.geojson");
+      // #region agent log
+      enqueueIngest({location:'App.tsx:424',message:'After GISService.loadLayer in loadHouseNumbers',data:{street},sourceFile:'App.tsx',sourceFn:'loadHouseNumbersForStreet'});
+      // #endregion
+      
+      // Get all house numbers for this street from the address points layer
+      const houseNumbers = GISService.listHouseNumbers(street);
+      // #region agent log
+      enqueueIngest({location:'App.tsx:427',message:'After listHouseNumbers',data:{street,houseNumbersCount:houseNumbers.length},sourceFile:'App.tsx',sourceFn:'loadHouseNumbersForStreet'});
+      // #endregion
+      
+      // Convert to strings and sort
+      const nums = houseNumbers.map(String).sort((a, b) => {
         const an = parseInt(a, 10);
         const bn = parseInt(b, 10);
         if (!Number.isNaN(an) && !Number.isNaN(bn)) return an - bn;
         return a.localeCompare(b, "he");
       });
-      setNumberSuggestions(nums);
+      
+      setAllHouseNumbers(nums);
+      // If there's no filter query, show all numbers
+      const currentQuery = numberQuery.trim().toLowerCase();
+      if (!currentQuery) {
+        setNumberSuggestions(nums);
+      } else {
+        // Filter based on existing query
+        const filtered = nums.filter((num) =>
+          num.toLowerCase().includes(currentQuery)
+        );
+        setNumberSuggestions(filtered);
+      }
     } catch (error) {
-      console.error("Number search failed", error);
-      setSearchError("אירעה שגיאה בחיפוש מספר הבית.");
+      console.error("Failed to load house numbers:", error);
+      setSearchError("אירעה שגיאה בטעינת מספרי הבתים.");
       setNumberSuggestions([]);
+      setAllHouseNumbers([]);
     } finally {
       setIsNumberLoading(false);
+    }
+  };
+
+  const performNumberSearch = (street: string, numberPart: string) => {
+    const qPart = numberPart.trim().toLowerCase();
+    
+    // If no query, show all house numbers for the street
+    if (!qPart) {
+      if (allHouseNumbers.length > 0) {
+        setNumberSuggestions(allHouseNumbers);
+      } else if (street) {
+        // Load house numbers if not already loaded
+        loadHouseNumbersForStreet(street);
+      }
+      return;
+    }
+
+    // Filter all house numbers based on the query
+    const filtered = allHouseNumbers.filter((num) =>
+      num.toLowerCase().includes(qPart)
+    );
+    
+    setNumberSuggestions(filtered);
+    
+    // If we have no results and haven't loaded yet, try loading
+    if (filtered.length === 0 && allHouseNumbers.length === 0 && street) {
+      loadHouseNumbersForStreet(street);
+    }
+  };
+
+  // ------------------------------------------------------------------
+  // Handler: Manual coordinate lookup
+  // ------------------------------------------------------------------
+  const handleManualCoordsLookup = async () => {
+    // Validate that both street and number are selected
+    if (!selectedStreet || !selectedNumber) {
+      setManualCoordsError("בחר רחוב ומספר בית קודם");
+      setManualCoords(null);
+      return;
+    }
+
+    // Parse house number
+    const houseNumber = parseInt(selectedNumber, 10);
+    if (isNaN(houseNumber) || houseNumber <= 0) {
+      setManualCoordsError("מספר בית לא תקין");
+      setManualCoords(null);
+      return;
+    }
+
+    // Set loading state
+    setIsManualCoordsLoading(true);
+    setManualCoordsError(null);
+    setManualCoords(null);
+
+    try {
+      // Call the helper function
+      const coords = await findNetivotAddressCoords(selectedStreet, houseNumber);
+
+      if (coords) {
+        // Success: set coordinates
+        setManualCoords(coords);
+        setManualCoordsError(null);
+      } else {
+        // Not found: set error message
+        setManualCoordsError("לא נמצאו קואורדינטות לכתובת הזו במאגר");
+        setManualCoords(null);
+      }
+    } catch (error) {
+      // Unexpected error: log and show generic message
+      console.error("Error in manual coordinate lookup:", error);
+      setManualCoordsError("אירעה שגיאה בחיפוש הקואורדינטות. אנא נסה שוב.");
+      setManualCoords(null);
+    } finally {
+      setIsManualCoordsLoading(false);
     }
   };
 
@@ -448,7 +556,11 @@ function App() {
     if (!file) return;
 
     setFileName(file.name);
+    setUploadedFile(file);
+    setError(null);
+    
     try {
+      // Read Excel to get initial row count and preview
       const rawData = await readExcel(file);
       const newRows: AddressRow[] = rawData.map((data, index) => {
         const keys = Object.keys(data);
@@ -485,10 +597,11 @@ function App() {
           originalData: data,
           address: rawAddr,
           originalAddress: rawAddr,
-          normalizedAddress: normalized ?? undefined,
+          normalizedAddress: normalized ?? null,
           detectedLatCol,
           detectedLonCol,
           originalCoords,
+          finalCoords: undefined,
           status: ProcessingStatus.PENDING,
           message,
         };
@@ -496,66 +609,62 @@ function App() {
 
       setRows(newRows);
       setProcessedUnique(0);
-      setTotalUnique(0);
+      setTotalUnique(newRows.length);
       setApiRequestsCount(0);
       setStatusFilter("ALL");
     } catch (error) {
       console.error("Error reading file", error);
+      setError("שגיאה בקריאת הקובץ");
       alert("Error reading file");
     }
   };
 
   const startProcessing = async () => {
+    // #region agent log
+    enqueueIngest({location:'App.tsx:553',message:'startProcessing called',data:{isProcessing,hasFile:!!uploadedFile},sourceFile:'App.tsx',sourceFn:'startProcessing'});
+    // #endregion
     if (isProcessing) return;
-    if (rows.length === 0) return;
+    if (!uploadedFile) {
+      setError("אנא בחר קובץ תחילה");
+      return;
+    }
 
     setIsProcessing(true);
-
-    const addressesToGeocode = Array.from(
-      new Set(
-        rows
-          .map((row) => {
-            const cacheKey = getCacheKey(row);
-            if (!cacheKey) return null;
-
-            const raw = (row.address || row.originalAddress || "").trim();
-            const addressForRules =
-              (row.normalizedAddress &&
-              row.normalizedAddress.trim().length > 0
-                ? row.normalizedAddress
-                : raw) || "";
-
-            if (isMissingFullAddress(addressForRules)) {
-              return null;
-            }
-
-            return cacheKey;
-          })
-          .filter((v): v is string => !!v)
-      )
-    );
-
-    setTotalUnique(addressesToGeocode.length);
+    setError(null);
     setProcessedUnique(0);
-    setApiRequestsCount(0);
 
-    setRows((prev) => prev.map((row) => classifyRowFromCache(row, false)));
-
-    const applyPartialResults = () => {
-      setRows((prev) => prev.map((row) => classifyRowFromCache(row, false)));
-    };
-
-    await batchGeocode(addressesToGeocode, 3, (count, isCacheHit) => {
-      setProcessedUnique((prev) => prev + count);
-      if (!isCacheHit) {
-        setApiRequestsCount((prev) => prev + 1);
-      }
-      applyPartialResults();
-    });
-
-    setRows((prev) => prev.map((row) => classifyRowFromCache(row, true)));
-
-    setIsProcessing(false);
+    try {
+      // #region agent log
+      enqueueIngest({location:'App.tsx:565',message:'Before processExcelFile',data:{fileName:uploadedFile.name,fileSize:uploadedFile.size},sourceFile:'App.tsx',sourceFn:'startProcessing'});
+      // #endregion
+      // Process the Excel file using the new pipeline with progress callback
+      const processedRows = await processExcelFile(uploadedFile, undefined, (processed, total) => {
+        setProcessedUnique(processed);
+        setTotalUnique(total);
+      });
+      // #region agent log
+      enqueueIngest({location:'App.tsx:568',message:'After processExcelFile',data:{rowsCount:processedRows.length,geocodedCount:processedRows.filter(r=>r.finalCoords!==undefined).length},sourceFile:'App.tsx',sourceFn:'startProcessing'});
+      // #endregion
+      
+      setRows(processedRows);
+      setProcessedUnique(processedRows.length);
+      setTotalUnique(processedRows.length);
+      
+      // Count API requests (approximate: one per row that was geocoded)
+      const geocodedCount = processedRows.filter(
+        (row) => row.finalCoords !== undefined
+      ).length;
+      setApiRequestsCount(geocodedCount);
+    } catch (error) {
+      // #region agent log
+      enqueueIngest({location:'App.tsx:577',message:'Error in startProcessing',data:{errorMessage:error instanceof Error?error.message:String(error),errorStack:error instanceof Error?error.stack:undefined},sourceFile:'App.tsx',sourceFn:'startProcessing'});
+      // #endregion
+      console.error("Error processing file:", error);
+      setError("שגיאה בעיבוד הקובץ. אנא נסה שוב.");
+      // Keep existing rows on error
+    } finally {
+      setIsProcessing(false);
+    }
   };
 
   const filteredRows = useMemo(() => {
@@ -573,22 +682,27 @@ function App() {
   }, [rows, statusFilter]);
 
   const stats = useMemo(() => {
+    const confirmed = rows.filter(
+      (r) => r.status === ProcessingStatus.CONFIRMED
+    ).length;
+
     const updated = rows.filter(
-      (r) =>
-        r.status === ProcessingStatus.UPDATED ||
-        r.status === ProcessingStatus.CONFIRMED
+      (r) => r.status === ProcessingStatus.UPDATED
+    ).length;
+
+    const needsReview = rows.filter(
+      (r) => r.status === ProcessingStatus.NEEDS_REVIEW
     ).length;
 
     const notFound = rows.filter(
-      (r) =>
-        r.status === ProcessingStatus.NOT_FOUND ||
-        r.status === ProcessingStatus.NEEDS_REVIEW
+      (r) => r.status === ProcessingStatus.NOT_FOUND
     ).length;
 
     const skipped = rows.filter(
       (r) => r.status === ProcessingStatus.SKIPPED
     ).length;
-    return { updated, notFound, skipped };
+    
+    return { confirmed, updated, needsReview, notFound, skipped };
   }, [rows]);
 
   const displayedRows = filteredRows.slice(0, 100);
@@ -664,9 +778,14 @@ function App() {
                   const value = e.target.value;
                   setStreetQuery(value);
                   setSelectedStreet(null);
+                  setAllHouseNumbers([]);
+                  setNumberSuggestions([]);
                   setSelectedNumber(null);
                   setNumberQuery("");
                   setNumberSuggestions([]);
+                  // Clear manual coords when street changes
+                  setManualCoords(null);
+                  setManualCoordsError(null);
                   performStreetSearch(value);
                 }}
               />
@@ -693,11 +812,17 @@ function App() {
                           ? "bg-blue-100 font-semibold"
                           : "")
                       }
-                      onClick={() => {
+                      onClick={async () => {
                         setSelectedStreet(street);
                         setSelectedNumber(null);
                         setNumberQuery("");
                         setNumberSuggestions([]);
+                        setAllHouseNumbers([]);
+                        // Clear manual coords when street changes
+                        setManualCoords(null);
+                        setManualCoordsError(null);
+                        // Load house numbers for the selected street
+                        await loadHouseNumbersForStreet(street);
                       }}
                     >
                       {street}
@@ -725,6 +850,11 @@ function App() {
                   setNumberQuery(value);
                   const trimmed = value.trim();
                   setSelectedNumber(trimmed || null);
+                  // Clear manual coords when number changes
+                  if (trimmed !== selectedNumber) {
+                    setManualCoords(null);
+                    setManualCoordsError(null);
+                  }
                   if (selectedStreet) {
                     performNumberSearch(selectedStreet, value);
                   } else {
@@ -745,8 +875,9 @@ function App() {
                   </div>
                 ) : numberSuggestions.length === 0 ? (
                   <div className="px-2 py-1 text-gray-500 text-xs">
-                    לא נמצאו מספרים במפת הכתובות (תוכל עדיין להקליד מספר
-                    ידנית)
+                    {selectedStreet
+                      ? "לא נמצאו מספרים במפת הכתובות (תוכל עדיין להקליד מספר ידנית)"
+                      : "לא נבחר רחוב"}
                   </div>
                 ) : (
                   numberSuggestions.map((num) => (
@@ -762,6 +893,9 @@ function App() {
                       onClick={() => {
                         setSelectedNumber(num);
                         setNumberQuery(num);
+                        // Clear manual coords when number changes
+                        setManualCoords(null);
+                        setManualCoordsError(null);
                       }}
                     >
                       {num}
@@ -774,6 +908,50 @@ function App() {
                 <p className="text-xs text-gray-600 mt-2">
                   נבחר: {selectedStreet} {selectedNumber}
                 </p>
+              )}
+
+              {/* Action button and result display */}
+              {selectedStreet && selectedNumber && (
+                <div className="mt-3 space-y-2">
+                  <button
+                    type="button"
+                    onClick={handleManualCoordsLookup}
+                    disabled={isManualCoordsLoading}
+                    className={`w-full px-4 py-2 rounded text-sm font-medium transition-colors ${
+                      isManualCoordsLoading
+                        ? "bg-gray-400 text-gray-200 cursor-not-allowed"
+                        : "bg-blue-600 hover:bg-blue-700 text-white"
+                    }`}
+                  >
+                    {isManualCoordsLoading ? "מחפש קואורדינטות..." : "מצא קואורדינטות"}
+                  </button>
+
+                  {/* Loading state */}
+                  {isManualCoordsLoading && (
+                    <p className="text-xs text-gray-500 text-center">
+                      מחפש קואורדינטות...
+                    </p>
+                  )}
+
+                  {/* Success: Display coordinates */}
+                  {!isManualCoordsLoading && manualCoords && (
+                    <div className="p-3 bg-green-50 border border-green-200 rounded text-sm">
+                      <p className="font-medium text-green-800 mb-1">
+                        קואורדינטות:
+                      </p>
+                      <p className="text-green-700 font-mono" dir="ltr">
+                        {manualCoords.lat.toFixed(6)}, {manualCoords.lon.toFixed(6)}
+                      </p>
+                    </div>
+                  )}
+
+                  {/* Error: Display error message */}
+                  {!isManualCoordsLoading && manualCoordsError && (
+                    <div className="p-3 bg-red-50 border border-red-200 rounded text-sm">
+                      <p className="text-red-700">{manualCoordsError}</p>
+                    </div>
+                  )}
+                </div>
               )}
             </div>
           </div>
@@ -815,8 +993,9 @@ function App() {
                 </div>
 
                 {!isProcessing &&
-                  rows[0].status ===
-                    ProcessingStatus.PENDING && (
+                  rows.length > 0 &&
+                  (rows[0].status === ProcessingStatus.PENDING ||
+                    rows.some((r) => r.status === ProcessingStatus.PENDING)) && (
                     <button
                       onClick={startProcessing}
                       className="flex items-center gap-2 px-6 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg shadow-md transition-all text-lg font-medium"
@@ -829,7 +1008,7 @@ function App() {
                 {isProcessing && (
                   <div className="w-full md:w-1/2 mt-4 md:mt-0">
                     <div className="flex justify-between text-sm mb-1">
-                      <span>מעבד כתובות...</span>
+                      <span>מעבד כתובות באמצעות HybridGeocoder...</span>
                       <span>
                         {totalUnique > 0
                           ? Math.round(
@@ -852,6 +1031,12 @@ function App() {
                     </div>
                   </div>
                 )}
+                
+                {error && (
+                  <div className="w-full mt-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+                    {error}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -859,10 +1044,10 @@ function App() {
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <button
                 onClick={() =>
-                  setStatusFilter(ProcessingStatus.UPDATED)
+                  setStatusFilter(ProcessingStatus.CONFIRMED)
                 }
                 className={`p-4 rounded-xl border text-right transition-all ${
-                  statusFilter === ProcessingStatus.UPDATED
+                  statusFilter === ProcessingStatus.CONFIRMED
                     ? "ring-2 ring-green-500 bg-green-50"
                     : "bg-white hover:bg-gray-50"
                 }`}
@@ -870,11 +1055,32 @@ function App() {
                 <div className="flex justify-between items-start">
                   <CheckCircle className="text-green-500" />
                   <span className="text-2xl font-bold">
-                    {stats.updated}
+                    {stats.confirmed}
                   </span>
                 </div>
                 <span className="text-sm text-gray-600 mt-2 block">
-                  עודכנו בהצלחה / תקינים
+                  מאושרים (דיוק גבוה)
+                </span>
+              </button>
+
+              <button
+                onClick={() =>
+                  setStatusFilter(ProcessingStatus.NEEDS_REVIEW)
+                }
+                className={`p-4 rounded-xl border text-right transition-all ${
+                  statusFilter === ProcessingStatus.NEEDS_REVIEW
+                    ? "ring-2 ring-yellow-500 bg-yellow-50"
+                    : "bg-white hover:bg-gray-50"
+                }`}
+              >
+                <div className="flex justify-between items-start">
+                  <AlertTriangle className="text-yellow-500" />
+                  <span className="text-2xl font-bold">
+                    {stats.needsReview}
+                  </span>
+                </div>
+                <span className="text-sm text-gray-600 mt-2 block">
+                  נדרש ביקורת
                 </span>
               </button>
 
@@ -928,7 +1134,7 @@ function App() {
                     : "bg-white hover:bg-gray-50"
                 }`}
               >
-                <div className="flex justify_between items-start">
+                <div className="flex justify-between items-start">
                   <RefreshCw className="text-blue-500" />
                   <span className="text-2xl font-bold">
                     {rows.length}

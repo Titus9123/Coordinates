@@ -46,7 +46,65 @@ function applyReplacementDictionary(value: string): string {
 }
 
 /**
+ * Unified street name normalization function.
+ * 
+ * This function normalizes street names for consistent matching across:
+ * - GIS lookup (gisService.ts)
+ * - Batch processing (normalizeAddress / extractStreetAndNumber)
+ * - UI street search (GISService.searchStreets)
+ * - Nominatim query building (hybridGeocoder.ts, geocoding.ts)
+ * 
+ * Rules applied in order:
+ * 1. Trim and collapse whitespace
+ * 2. Replace punctuation separators with spaces
+ * 3. Remove quotes and apostrophes
+ * 4. Normalize Hebrew abbreviation prefixes
+ * 5. Remove leading street prefixes (only at start)
+ * 6. Final trim and collapse whitespace
+ * 
+ * Does NOT lowercase Hebrew text (only latin characters if present).
+ * Does NOT add fuzzy logic or synonym maps.
+ */
+export function normalizeStreetText(input: string): string {
+  if (!input) return "";
+  
+  // Step 1: Trim and collapse whitespace
+  let normalized = input.trim().replace(/\s+/g, " ");
+  
+  // Step 2: Replace punctuation separators with spaces
+  // Convert "-", "–", "—", "/", "\" into spaces
+  normalized = normalized.replace(/[-–—\/\\]/g, " ");
+  
+  // Step 3: Remove quotes and apostrophes: ", ', ׳, ״
+  normalized = normalized.replace(/["'׳״]/g, "");
+  
+  // Step 4: Normalize Hebrew abbreviation prefixes at the start of tokens
+  // Replace "רח'" with "רחוב"
+  normalized = normalized.replace(/\bרח'/g, "רחוב");
+  // Replace "שכ'" with "שכונת"
+  normalized = normalized.replace(/\bשכ'/g, "שכונת");
+  
+  // Step 5: Remove leading street prefixes only when they appear as standalone tokens at the beginning
+  // If the string starts with "רחוב " remove that token
+  normalized = normalized.replace(/^רחוב\s+/g, "");
+  // If it starts with "רח " remove that token
+  normalized = normalized.replace(/^רח\s+/g, "");
+  
+  // Step 6: Final trim and collapse whitespace again
+  normalized = normalized.replace(/\s+/g, " ").trim();
+  
+  // Step 7: Lowercase latin characters only (do NOT lowercase Hebrew)
+  // Split into characters, lowercase only latin (a-z, A-Z), keep Hebrew as-is
+  normalized = normalized.replace(/[a-zA-Z]/g, (char) => char.toLowerCase());
+  
+  return normalized;
+}
+
+/**
  * Limpia prefijos redundantes como "רחוב" o "רח'".
+ * 
+ * NOTE: This function is kept for backward compatibility with normalizeAddress().
+ * For new code, use normalizeStreetText() instead.
  */
 function stripStreetPrefixes(value: string): string {
   return value.replace(/^\s*(רחוב|רח'|רח)\s+/g, "");
@@ -278,12 +336,15 @@ export function normalizeAddress(raw: string): string | null {
     return null;
   }
 
-  const street = streetNumberMatch[1].trim();
+  const streetRaw = streetNumberMatch[1].trim();
   const houseNumber = streetNumberMatch[2].trim();
 
-  if (!street || !houseNumber) {
+  if (!streetRaw || !houseNumber) {
     return null;
   }
+
+  // Normalize street name using unified normalizeStreetText() for consistency
+  const street = normalizeStreetText(streetRaw);
 
   // 10) Construir el formato FINAL para geocoding:
   // SOLO calle + número + Netivot (como definimos).
@@ -348,15 +409,17 @@ export function extractStreetAndNumber(
   const numberRegex = /^\d+[א-ת]?$/
 
   if (numberRegex.test(last)) {
-    const streetName = tokens.slice(0, -1).join(" ").trim();
+    const streetNameRaw = tokens.slice(0, -1).join(" ").trim();
     const number = last.trim();
-    if (!streetName) {
+    if (!streetNameRaw) {
       // Caso raro: solo número, lo tratamos como sin calle
       return { street: "", number: number };
     }
+    // Use normalizeStreetText() for consistent street name normalization
+    const streetName = normalizeStreetText(streetNameRaw);
     return { street: streetName, number };
   }
 
-  // 8) Si no hay número claro, devolvemos todo como calle
-  return { street: mainPart, number: null };
+  // 8) Si no hay número claro, devolvemos todo como calle (normalized)
+  return { street: normalizeStreetText(mainPart), number: null };
 }
