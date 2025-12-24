@@ -369,13 +369,13 @@ async function ensureGISSearchInitialized(): Promise<void> {
       // #region agent log
       enqueueIngest({location:'geocoding.ts:360',message:'Before GISService.loadLayer in ensureGISSearch',data:{},sourceFile:'geocoding.ts',sourceFn:'ensureGISSearchInitialized'});
       // #endregion
-      await GISService.loadLayer("/public/gis/netivot.geojson");
+      await GISService.loadLayer("/gis/netivot.geojson");
       // #region agent log
       enqueueIngest({location:'geocoding.ts:363',message:'After GISService.loadLayer in ensureGISSearch',data:{},sourceFile:'geocoding.ts',sourceFn:'ensureGISSearchInitialized'});
       // #endregion
       
       // Load the street segments layer (for street search)
-      await GISService.ensureStreetSegmentsLoaded("/public/gis/שמות_רחובות_2025.geojson");
+      await GISService.ensureStreetSegmentsLoaded("/gis/שמות_רחובות_2025.geojson");
       // #region agent log
       enqueueIngest({location:'geocoding.ts:366',message:'After ensureStreetSegmentsLoaded in ensureGISSearch',data:{},sourceFile:'geocoding.ts',sourceFn:'ensureGISSearchInitialized'});
       // #endregion

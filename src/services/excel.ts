@@ -127,7 +127,7 @@ let geocoderInitialized = false;
  * Ensures HybridGeocoder is initialized.
  * This function is idempotent - it only initializes once.
  * 
- * @param gisLayerPath - Optional path to GIS layer (defaults to "/public/gis/netivot.geojson")
+ * @param gisLayerPath - Optional path to GIS layer (defaults to "/gis/netivot.geojson")
  */
 async function ensureGeocoderInitialized(gisLayerPath?: string): Promise<void> {
   // #region agent log
@@ -183,7 +183,7 @@ export async function processExcelRows(
  * 5. Returns fully processed AddressRow[] with coordinates and statuses
  * 
  * @param file - Excel file to process
- * @param gisLayerPath - Optional path to GIS layer (defaults to "/public/gis/netivot.geojson")
+ * @param gisLayerPath - Optional path to GIS layer (defaults to "/gis/netivot.geojson")
  * @returns Processed AddressRow[] with coordinates and statuses assigned
  * @throws Error if file cannot be read or geocoder cannot be initialized
  */

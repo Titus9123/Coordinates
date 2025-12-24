@@ -61,7 +61,7 @@ interface HybridGeocoderState {
 
 const state: HybridGeocoderState = {
   initialized: false,
-  gisLayerPath: "/public/gis/netivot.geojson",
+  gisLayerPath: "/gis/netivot.geojson",
 };
 
 // ============================================================================
@@ -262,7 +262,7 @@ function convertNominatimResultToHybrid(
  * Initializes the HybridGeocoder by loading the GIS layer.
  * Must be called before using geocode().
  * 
- * @param gisLayerPath - Optional path to GIS layer (defaults to "/public/gis/netivot.geojson")
+ * @param gisLayerPath - Optional path to GIS layer (defaults to "/gis/netivot.geojson")
  * @throws Error if GIS layer cannot be loaded
  */
 async function init(gisLayerPath?: string): Promise<void> {
@@ -283,7 +283,7 @@ async function init(gisLayerPath?: string): Promise<void> {
     
     // Load street segments layer (for street search)
     // This ensures street search works even if not explicitly initialized elsewhere
-    await GISService.ensureStreetSegmentsLoaded("/public/gis/שמות_רחובות_2025.geojson");
+    await GISService.ensureStreetSegmentsLoaded("/gis/שמות_רחובות_2025.geojson");
     // #region agent log
     enqueueIngest({location:'hybridGeocoder.ts:216',message:'After ensureStreetSegmentsLoaded',data:{},sourceFile:'hybridGeocoder.ts',sourceFn:'init'});
     // #endregion

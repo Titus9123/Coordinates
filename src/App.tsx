@@ -434,7 +434,7 @@ function App() {
       // #region agent log
       enqueueIngest({location:'App.tsx:421',message:'Before GISService.loadLayer in loadHouseNumbers',data:{street},sourceFile:'App.tsx',sourceFn:'loadHouseNumbersForStreet'});
       // #endregion
-      await GISService.loadLayer("/public/gis/netivot.geojson");
+      await GISService.loadLayer("/gis/netivot.geojson");
       // #region agent log
       enqueueIngest({location:'App.tsx:424',message:'After GISService.loadLayer in loadHouseNumbers',data:{street},sourceFile:'App.tsx',sourceFn:'loadHouseNumbersForStreet'});
       // #endregion

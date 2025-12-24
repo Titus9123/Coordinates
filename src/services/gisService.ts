@@ -252,12 +252,12 @@ function interpolateCoordinates(
  * Loads the address points layer from netivot.geojson.
  * Parses the GeoJSON and stores address features in memory for fast lookup.
  * 
- * @param pathOrUrl - Path to GeoJSON file (defaults to "/public/gis/netivot.geojson") or URL
+ * @param pathOrUrl - Path to GeoJSON file (defaults to "/gis/netivot.geojson") or URL
  * @throws Error if file cannot be loaded or parsed
  */
 export async function loadLayer(pathOrUrl?: string): Promise<void> {
   // Default to netivot.geojson if not provided
-  const layerPath = pathOrUrl || "/public/gis/netivot.geojson";
+  const layerPath = pathOrUrl || "/gis/netivot.geojson";
   // #region agent log
   enqueueIngest({location:'gisService.ts:263',message:'loadLayer called',data:{layerPath,alreadyLoaded:addressLayerLoaded,currentPath:addressLayerPath},sourceFile:'gisService.ts',sourceFn:'loadLayer'});
   // #endregion
@@ -626,12 +626,12 @@ export function lookupAddress(
  * Loads the street segments layer from שמות_רחובות_2025.geojson.
  * Parses the GeoJSON and stores unique street names for fast search.
  * 
- * @param pathOrUrl - Path to GeoJSON file (defaults to "/public/gis/שמות_רחובות_2025.geojson") or URL
+ * @param pathOrUrl - Path to GeoJSON file (defaults to "/gis/שמות_רחובות_2025.geojson") or URL
  * @throws Error if file cannot be loaded or parsed
  */
 async function loadStreetSegmentsLayer(pathOrUrl?: string): Promise<void> {
   // Default to שמות_רחובות_2025.geojson if not provided
-  const layerPath = pathOrUrl || "/public/gis/שמות_רחובות_2025.geojson";
+  const layerPath = pathOrUrl || "/gis/שמות_רחובות_2025.geojson";
   
   // If already loaded, skip reload (idempotent)
   if (streetSegmentsLoaded && streetSegments.length > 0) {
